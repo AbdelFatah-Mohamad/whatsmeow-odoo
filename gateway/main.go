@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -44,8 +45,11 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	listenAddr     = envOr("WMG_LISTEN", "127.0.0.1:8080")
-	apiKey         = os.Getenv("WMG_API_KEY")          // required
+	listenAddr = envOr("WMG_LISTEN", "127.0.0.1:8080")
+	apiKey     = os.Getenv("WMG_API_KEY") // required; admin key, opens every session
+	// Optional per-session keys, "session:token,session:token". A session key opens only its own
+	// /sessions/<name>/... routes, so one gateway can serve tenants that do not trust each other.
+	sessionKeys    = parseSessionKeys(os.Getenv("WMG_SESSION_KEYS"))
 	odooWebhookURL = os.Getenv("WMG_ODOO_WEBHOOK_URL") // e.g. https://odoo.example.com/whatsmeow/webhook
 	webhookSecret  = os.Getenv("WMG_WEBHOOK_SECRET")   // shared secret sent to Odoo
 	dataDir        = envOr("WMG_DATA_DIR", "./data")   // one sqlite DB per session
@@ -253,16 +257,19 @@ func makeEventHandler(s *Session) func(interface{}) {
 		switch v := evt.(type) {
 
 		case *events.Message:
-			if v.Info.IsFromMe {
-				return // don't loop our own outbound back into Odoo
-			}
 			// A reaction is not a message, it annotates one. Surface it as its
 			// own event so Odoo can put it on the target message instead of
 			// storing a noisy "[reaction] 👍" line of its own.
 			if react := reactionOf(v.Message); react != nil {
+				if v.Info.IsFromMe {
+					return // our own reaction: nothing for Odoo to thread
+				}
 				notifyOdoo(s.Name, "message.reaction", s.reactionPayload(v, react))
 				return
 			}
+			// Own messages are forwarded rather than dropped, so a reply typed on the phone
+			// shows up in the Odoo conversation. The payload carries is_from_me, and an echo of
+			// a message Odoo itself sent is deduplicated there by wa_message_id.
 			text := extractText(v.Message)
 			// Media is downloaded now, not on demand: WhatsApp expires it from
 			// its servers, so a later fetch would find nothing.
@@ -315,6 +322,7 @@ func makeEventHandler(s *Session) func(interface{}) {
 				"addressing_mode": string(v.Info.AddressingMode),
 				"push_name":       v.Info.PushName,
 				"is_group":        v.Info.IsGroup,
+				"is_from_me":      v.Info.IsFromMe, // sent from the linked phone, not received
 				"chat_jid":        v.Info.Chat.String(),
 				"chat_name":       chatName, // "" unless this is a group
 				"body":            text,     // caption, for media
@@ -1695,17 +1703,66 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// parseSessionKeys reads "session:token,session:token" into a lookup.
+func parseSessionKeys(raw string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		name, tok, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		name, tok = strings.TrimSpace(name), strings.TrimSpace(tok)
+		if ok && name != "" && tok != "" {
+			out[name] = tok
+		}
+	}
+	return out
+}
+
+// sessionFromPath returns the {name} of /sessions/{name}/... , or "" for anything else.
+// The mux populates PathValue only after routing, so the segment is read by hand here.
+func sessionFromPath(p string) string {
+	parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	if len(parts) >= 3 && parts[0] == "sessions" && parts[1] != "" {
+		return parts[1]
+	}
+	return ""
+}
+
+// presentedKey accepts the documented X-Api-Key, and a bearer token for clients that send
+// credentials the usual HTTP way.
+func presentedKey(r *http.Request) string {
+	if k := r.Header.Get("X-Api-Key"); k != "" {
+		return k
+	}
+	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+		return strings.TrimPrefix(a, "Bearer ")
+	}
+	return ""
+}
+
+func tokenMatches(presented, want string) bool {
+	// Constant time: a plain != leaks the shared secret one byte at a time under timing analysis.
+	return want != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(want)) == 1
+}
+
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if apiKey == "" || r.Header.Get("X-Api-Key") != apiKey {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing X-Api-Key"})
+		presented := presentedKey(r)
+		// The admin key opens everything, including GET /sessions, which enumerates every tenant.
+		if tokenMatches(presented, apiKey) {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		// A session key opens only that session's own routes.
+		if name := sessionFromPath(r.URL.Path); name != "" {
+			if tokenMatches(presented, sessionKeys[name]) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing X-Api-Key"})
 	})
 }
 
