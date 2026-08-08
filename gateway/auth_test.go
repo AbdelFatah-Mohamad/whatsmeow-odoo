@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // The middleware is the only thing standing between a tenant and every other tenant's
@@ -104,5 +106,128 @@ func TestEmptyKeysLockEverythingOut(t *testing.T) {
 	}
 	if got := serve(t, "POST", "/sessions/acme/send", nil); got != 401 {
 		t.Errorf("no header at all = %d, want 401", got)
+	}
+}
+
+// --- per-session webhook routing -----------------------------------------
+// Each tenant has its own Odoo, so a single global URL would deliver every client's
+// messages into one database.
+
+func TestParseSessionHooks(t *testing.T) {
+	got := parseSessionHooks(
+		" acme=https://acme.example.com/hook|s1 , globex=https://globex.example.com/hook ,, bad , nourl= ")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 routes, got %d: %v", len(got), got)
+	}
+	if got["acme"].url != "https://acme.example.com/hook" || got["acme"].secret != "s1" {
+		t.Errorf("acme route wrong: %+v", got["acme"])
+	}
+	if got["globex"].url != "https://globex.example.com/hook" || got["globex"].secret != "" {
+		t.Errorf("globex should inherit the global secret: %+v", got["globex"])
+	}
+	if len(parseSessionHooks("")) != 0 {
+		t.Error("an empty setting must yield no routes")
+	}
+}
+
+func TestRouteFor(t *testing.T) {
+	odooWebhookURL = "https://shared.example.com/hook"
+	webhookSecret = "GLOBAL"
+	sessionHooks = parseSessionHooks(
+		"acme=https://acme.example.com/hook|ACMESECRET,globex=https://globex.example.com/hook")
+	t.Cleanup(func() {
+		odooWebhookURL, webhookSecret = "", ""
+		sessionHooks = map[string]webhookRoute{}
+	})
+
+	if r := routeFor("acme"); r.url != "https://acme.example.com/hook" || r.secret != "ACMESECRET" {
+		t.Errorf("acme: %+v", r)
+	}
+	// A route with no secret of its own falls back to the global one.
+	if r := routeFor("globex"); r.url != "https://globex.example.com/hook" || r.secret != "GLOBAL" {
+		t.Errorf("globex: %+v", r)
+	}
+	// An unlisted session keeps the old single-Odoo behaviour.
+	if r := routeFor("initech"); r.url != "https://shared.example.com/hook" || r.secret != "GLOBAL" {
+		t.Errorf("initech should fall back: %+v", r)
+	}
+	// Crucially, one tenant's events never carry another tenant's secret.
+	if routeFor("acme").secret == routeFor("initech").secret {
+		t.Error("a per-session secret must not equal the global one")
+	}
+}
+
+func TestNoRouteMeansNoDelivery(t *testing.T) {
+	odooWebhookURL = ""
+	webhookSecret = ""
+	sessionHooks = map[string]webhookRoute{}
+	t.Cleanup(func() { sessionHooks = map[string]webhookRoute{} })
+	if routeFor("nobody").url != "" {
+		t.Error("with nothing configured there must be no target")
+	}
+}
+
+// Exercises the real delivery path — notifyOdoo -> queue -> worker -> postToOdoo — against two
+// stand-in Odoo servers, which is the thing that actually matters: one tenant's WhatsApp events
+// must never land in another tenant's database, nor carry its secret.
+func TestWebhookRoutingDeliversEachTenantToItsOwnOdoo(t *testing.T) {
+	type delivery struct{ secret, session string }
+	acmeGot := make(chan delivery, 4)
+	globexGot := make(chan delivery, 4)
+
+	mk := func(sink chan delivery) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Session string `json:"session"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			sink <- delivery{secret: r.Header.Get("X-Webhook-Secret"), session: body.Session}
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	acme, globex := mk(acmeGot), mk(globexGot)
+	defer acme.Close()
+	defer globex.Close()
+
+	odooWebhookURL, webhookSecret = "", "GLOBAL"
+	sessionHooks = parseSessionHooks(
+		"acme=" + acme.URL + "|ACMESECRET,globex=" + globex.URL + "|GLOBEXSECRET")
+	t.Cleanup(func() {
+		odooWebhookURL, webhookSecret = "", ""
+		sessionHooks = map[string]webhookRoute{}
+	})
+
+	startWebhookWorkers()
+	notifyOdoo("acme", "message.received", map[string]any{"body": "for acme"})
+	notifyOdoo("globex", "message.received", map[string]any{"body": "for globex"})
+
+	recv := func(name string, ch chan delivery) delivery {
+		t.Helper()
+		select {
+		case d := <-ch:
+			return d
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s's Odoo received nothing", name)
+			return delivery{}
+		}
+	}
+	a, g := recv("acme", acmeGot), recv("globex", globexGot)
+
+	if a.session != "acme" || a.secret != "ACMESECRET" {
+		t.Errorf("acme delivery wrong: %+v", a)
+	}
+	if g.session != "globex" || g.secret != "GLOBEXSECRET" {
+		t.Errorf("globex delivery wrong: %+v", g)
+	}
+	// Nothing crossed over.
+	select {
+	case extra := <-acmeGot:
+		t.Errorf("acme's Odoo also received %+v — tenants are not isolated", extra)
+	default:
+	}
+	select {
+	case extra := <-globexGot:
+		t.Errorf("globex's Odoo also received %+v — tenants are not isolated", extra)
+	default:
 	}
 }

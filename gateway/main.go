@@ -50,10 +50,14 @@ var (
 	// Optional per-session keys, "session:token,session:token". A session key opens only its own
 	// /sessions/<name>/... routes, so one gateway can serve tenants that do not trust each other.
 	sessionKeys    = parseSessionKeys(os.Getenv("WMG_SESSION_KEYS"))
-	odooWebhookURL = os.Getenv("WMG_ODOO_WEBHOOK_URL") // e.g. https://odoo.example.com/whatsmeow/webhook
-	webhookSecret  = os.Getenv("WMG_WEBHOOK_SECRET")   // shared secret sent to Odoo
-	dataDir        = envOr("WMG_DATA_DIR", "./data")   // one sqlite DB per session
-	nonDigits      = regexp.MustCompile(`\D`)
+	odooWebhookURL = os.Getenv("WMG_ODOO_WEBHOOK_URL") // fallback for sessions with no route of their own
+	webhookSecret  = os.Getenv("WMG_WEBHOOK_SECRET")   // secret paired with the fallback URL
+	// Per-session webhook routes, "session=url|secret,session=url". Without these, every
+	// session's events go to one Odoo — which is wrong the moment two tenants have separate
+	// databases. The secret is optional and falls back to WMG_WEBHOOK_SECRET.
+	sessionHooks = parseSessionHooks(os.Getenv("WMG_SESSION_WEBHOOKS"))
+	dataDir      = envOr("WMG_DATA_DIR", "./data") // one sqlite DB per session
+	nonDigits    = regexp.MustCompile(`\D`)
 
 	// Inbound media is downloaded to disk and fetched by Odoo over the API
 	// rather than inlined into the webhook: WhatsApp allows ~100MB files, and
@@ -757,10 +761,51 @@ func quotedID(msg *waE2E.Message) string {
 	return ""
 }
 
-// notifyOdoo posts an event to the Odoo webhook with retries, so a short
+// webhookRoute is where one session's events are delivered.
+type webhookRoute struct {
+	url    string
+	secret string
+}
+
+// parseSessionHooks reads "session=url|secret,session=url" into a lookup. An entry with no
+// "|secret" inherits WMG_WEBHOOK_SECRET.
+func parseSessionHooks(raw string) map[string]webhookRoute {
+	out := map[string]webhookRoute{}
+	for _, entry := range strings.Split(raw, ",") {
+		name, rest, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" || rest == "" {
+			continue
+		}
+		url, secret, hasSecret := strings.Cut(rest, "|")
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		route := webhookRoute{url: url}
+		if hasSecret {
+			route.secret = strings.TrimSpace(secret)
+		}
+		out[name] = route
+	}
+	return out
+}
+
+// routeFor returns the webhook target for a session, falling back to the global one.
+func routeFor(session string) webhookRoute {
+	if r, ok := sessionHooks[session]; ok {
+		if r.secret == "" {
+			r.secret = webhookSecret
+		}
+		return r
+	}
+	return webhookRoute{url: odooWebhookURL, secret: webhookSecret}
+}
+
+// notifyOdoo posts an event to the session's Odoo webhook with retries, so a short
 // Odoo outage doesn't silently drop inbound messages.
 func notifyOdoo(session, event string, data map[string]any) {
-	if odooWebhookURL == "" {
+	if routeFor(session).url == "" {
 		return
 	}
 	payload := map[string]any{
@@ -805,15 +850,17 @@ func startWebhookWorkers() {
 var webhookClient = &http.Client{Timeout: 15 * time.Second}
 
 func postToOdoo(job webhookJob) {
+	// Resolved per job, not per process: each tenant has its own Odoo and its own secret.
+	route := routeFor(job.session)
 	backoff := 2 * time.Second
 	for attempt := 1; attempt <= 4; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, odooWebhookURL, bytes.NewReader(job.body))
+		req, err := http.NewRequest(http.MethodPost, route.url, bytes.NewReader(job.body))
 		if err != nil {
 			log.Printf("[%s] webhook build error: %v", job.session, err)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Webhook-Secret", webhookSecret)
+		req.Header.Set("X-Webhook-Secret", route.secret)
 
 		resp, err := webhookClient.Do(req)
 		if err == nil {
