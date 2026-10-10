@@ -953,3 +953,25 @@ func TestSimulateTypingWithoutAClient(t *testing.T) {
 		t.Fatal("simulateTyping slept without a client to type to")
 	}
 }
+
+func TestForwardMessage(t *testing.T) {
+	prev := forwardOwnMessages
+	defer func() { forwardOwnMessages = prev }()
+	cases := []struct {
+		name                   string
+		on, fromMe, isReaction bool
+		want                   bool
+	}{
+		{"inbound message", false, false, false, true},
+		{"inbound reaction", false, false, true, true},
+		{"own message, forwarding off", false, true, false, false},
+		{"own message, forwarding on", true, true, false, true},
+		{"own reaction, forwarding on", true, true, true, false},
+	}
+	for _, c := range cases {
+		forwardOwnMessages = c.on
+		if got := forwardMessage(c.fromMe, c.isReaction); got != c.want {
+			t.Errorf("%s: forwardMessage(%v, %v) = %v, want %v", c.name, c.fromMe, c.isReaction, got, c.want)
+		}
+	}
+}

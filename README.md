@@ -183,6 +183,7 @@ The gateway reads `/opt/whatsmeow-gateway/gateway.env`. Defaults are sensible;
 | `WMG_MEDIA_TTL_HOURS` | `24` | Before uncollected media is GC'd |
 | `WMG_CHECK_PER_HOUR` | `500` | Uncached number lookups per session per hour |
 | `WMG_WEBHOOK_QUEUE` | `512` | Events buffered per session — a safety limit, not a throughput dial |
+| `WMG_FORWARD_OWN_MESSAGES` | `0` | Pass on messages sent from the linked phone, flagged `is_from_me` — only for an Odoo that reads the flag |
 | `WMG_MAX_SESSIONS_PER_CLIENT` | `10` | Sessions one Odoo may register |
 
 Two pairs must be kept in sync across the language boundary, and both are commented

@@ -58,7 +58,12 @@ var (
 	// webhook delivery retries, so a big payload would be re-sent several times.
 	mediaDir      = filepath.Join(dataDir, "media")
 	maxMediaBytes = int64(envIntOr("WMG_MAX_MEDIA_MB", 100)) << 20
-	mediaTTL      = time.Duration(envIntOr("WMG_MEDIA_TTL_HOURS", 24)) * time.Hour
+	// A message this account sends from another device -- a reply typed on the
+	// phone -- is passed on flagged is_from_me, so Odoo can show the whole
+	// conversation. Off by default: a client that does not read the flag would
+	// take its own messages for the customer's.
+	forwardOwnMessages = envBoolOr("WMG_FORWARD_OWN_MESSAGES", false)
+	mediaTTL           = time.Duration(envIntOr("WMG_MEDIA_TTL_HOURS", 24)) * time.Hour
 )
 
 func envOr(key, def string) string {
@@ -301,18 +306,29 @@ func (m *Manager) restoreExisting() {
 // WhatsApp event handling -> forward to Odoo webhook
 // ---------------------------------------------------------------------------
 
+// forwardMessage decides whether a message event goes on to Odoo. Our own
+// messages only when forwarding is on, and never our own reactions: there is
+// nothing in Odoo to thread them onto.
+func forwardMessage(fromMe, isReaction bool) bool {
+	if !fromMe {
+		return true
+	}
+	return forwardOwnMessages && !isReaction
+}
+
 func makeEventHandler(s *Session) func(interface{}) {
 	return func(evt interface{}) {
 		switch v := evt.(type) {
 
 		case *events.Message:
-			if v.Info.IsFromMe {
-				return // don't loop our own outbound back into Odoo
+			react := reactionOf(v.Message)
+			if !forwardMessage(v.Info.IsFromMe, react != nil) {
+				return
 			}
 			// A reaction is not a message, it annotates one. Surface it as its
 			// own event so Odoo can put it on the target message instead of
 			// storing a noisy "[reaction] 👍" line of its own.
-			if react := reactionOf(v.Message); react != nil {
+			if react != nil {
 				s.notify("message.reaction", s.reactionPayload(v, react))
 				return
 			}
@@ -402,6 +418,10 @@ func makeEventHandler(s *Session) func(interface{}) {
 				"body":            text,     // caption, for media
 				"placeholder":     placeholder,
 				"timestamp":       v.Info.Timestamp.UTC().Format(time.RFC3339),
+				// Sent from the linked phone, not received. Only ever true when
+				// WMG_FORWARD_OWN_MESSAGES is on; then sender_* is this account
+				// and chat_jid is the other party.
+				"is_from_me": v.Info.IsFromMe,
 			}
 			if q := quotedID(v.Message); q != "" {
 				// The message this one replies to, so Odoo can thread it.
